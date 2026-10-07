@@ -22,6 +22,7 @@
   <button id="bVerify">Проверить</button>
   <button id="bAccess">Запросить доступ</button>
   <button id="bSend">Отправить тест</button>
+  <button id="bBatch">Прогон 20×</button>
   <button id="bCopy">Скопировать отчёт</button>
 </div>
 <pre id="out"></pre>
@@ -38,7 +39,8 @@ const scheme = (typeof google !== 'undefined' && google.script && google.script.
 const S = {            // всё, что показываем; один источник для экрана и отчёта
   log: [],
   t: {},
-  verify: null, tamper: null, send: null, access: null, ping: null
+  verify: null, tamper: null, send: null, access: null, ping: null,
+  reqs: [], batch: null
 };
 
 function now() { return Math.round(performance.now()); }
@@ -56,26 +58,64 @@ function urlParam(name) {
   return null;
 }
 
+// Журнал каждого HTTP-запроса схемы (б): статус, итоговый адрес после редиректа, заголовок HTML, номер попытки.
+let reqSeq = 0;
+function pageText(html) {
+  const m = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+  const title = m ? m[1].replace(/\s+/g, ' ').trim().slice(0, 100) : '(нет title)';
+  const visible = html.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+  return { title: title, visible: visible };
+}
+function shortUrl(u) { try { const x = new URL(u); return x.host + x.pathname.slice(0, 40) + (x.search ? '?…' : ''); } catch (e) { return String(u).slice(0, 60); } }
+
+// Один HTTP-запрос. credentials:'omit' — без cookie Google (несколько аккаунтов во встроенном браузере);
+// cache:'no-store' — без кэша ответа.
+function fetchOnce(fn, body, attempt) {
+  const rec = { n: ++reqSeq, fn: fn, attempt: attempt };
+  const started = performance.now();
+  return fetch(EXEC_URL, {
+    method: 'POST', redirect: 'follow', credentials: 'omit', cache: 'no-store',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: body
+  }).then(async (r) => {
+    const txt = await r.text();
+    rec.status = r.status; rec.redirected = r.redirected; rec.url = shortUrl(r.url);
+    rec.ctype = (r.headers.get('content-type') || '').split(';')[0];
+    rec.ms = Math.round(performance.now() - started);
+    try { rec.json = JSON.parse(txt); rec.ok = true; }
+    catch (e) { rec.ok = false; Object.assign(rec, pageText(txt)); rec.len = txt.length; }
+    S.reqs.push(rec);
+    return rec;
+  }, (err) => {
+    rec.ok = false; rec.status = 'сеть'; rec.title = String(err && err.message ? err.message : err);
+    rec.ms = Math.round(performance.now() - started);
+    S.reqs.push(rec);
+    return rec;
+  });
+}
+
 // Транспорт: google.script.run в схеме (а), fetch POST text/plain (без preflight) в схеме (б).
-function call(fn, args) {
+// retries — число повторов при не-JSON ответе; только для идемпотентных вызовов (ping, verify), не для sendTest.
+async function call(fn, args, opts) {
+  const retries = (opts && opts.retries) || 0;
   const body = JSON.stringify({ fn: fn, args: args || {} });
   const started = performance.now();
-  const done = (r) => ({ resp: r, roundtripMs: Math.round(performance.now() - started) });
+  const done = (r, attempts) => ({ resp: r, roundtripMs: Math.round(performance.now() - started), attempts: attempts });
   if (scheme.startsWith('a')) {
     return new Promise((resolve, reject) => {
       google.script.run
-        .withSuccessHandler((s) => resolve(done(JSON.parse(s))))
+        .withSuccessHandler((s) => resolve(done(JSON.parse(s), 1)))
         .withFailureHandler((e) => reject(e))
         .api(body);
     });
   }
-  return fetch(EXEC_URL, {
-    method: 'POST', redirect: 'follow',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: body
-  }).then((r) => r.text()).then((txt) => {
-    try { return done(JSON.parse(txt)); }
-    catch (e) { throw new Error('ответ не JSON: ' + txt.slice(0, 200)); }
-  });
+  let rec;
+  for (let attempt = 1; attempt <= retries + 1; attempt++) {
+    rec = await fetchOnce(fn, body, attempt);
+    if (rec.ok) return done(rec.json, attempt);
+    if (attempt <= retries) await new Promise((r) => setTimeout(r, 800));
+  }
+  throw new Error('ответ не JSON после ' + (retries + 1) + ' попыт.: HTTP ' + rec.status + ', «' + rec.title + '»');
 }
 
 // Намеренно испорченный initData: меняем последний символ hash.
@@ -86,12 +126,12 @@ function tamperedInitData(s) {
 function summarize(r) {
   if (!r) return 'не запускалось';
   if (r.error) return 'ОШИБКА: ' + r.error;
-  return JSON.stringify(r.resp) + ' | запрос→ответ ' + r.roundtripMs + ' мс';
+  return JSON.stringify(r.resp) + ' | запрос→ответ ' + r.roundtripMs + ' мс' + (r.attempts > 1 ? ' (попыток ' + r.attempts + ')' : '');
 }
 
 async function run(name, fn, args) {
   try {
-    const r = await call(fn, args);
+    const r = await call(fn, args, { retries: fn === 'sendTest' ? 0 : 2 });
     S[name] = r;
     logEv(name + ' ← ' + (r.resp.ok ? 'ok' : 'ошибка сервера'));
   } catch (e) {
@@ -100,6 +140,8 @@ async function run(name, fn, args) {
   }
   render();
 }
+
+function median(a) { const b = a.slice().sort((x, y) => x - y); return b[Math.floor(b.length / 2)]; }
 
 function lines() {
   const u = unsafeUser();
@@ -115,6 +157,7 @@ function lines() {
   L.push('ключи в location.hash: ' + (location.hash ? [...new URLSearchParams(location.hash.slice(1)).keys()].join(',') : 'пусто'));
   L.push('user.id (клиент, не доверять): ' + (u ? u.id : '-'));
   L.push('allows_write_to_pm (из initData при открытии): ' + (u ? JSON.stringify(u.allows_write_to_pm) : '-'));
+  L.push('Браузер: ' + navigator.userAgent.slice(0, 140) + '; onLine=' + navigator.onLine + '; cookies=' + navigator.cookieEnabled);
   L.push('Время: DOM→скрипт ' + Math.round(S.t.script) + ' мс; initData готов ' + (S.t.initData == null ? '-' : Math.round(S.t.initData) + ' мс') + ' (от начала навигации)');
   L.push('Сервер (ping): ' + summarize(S.ping));
   L.push('');
@@ -134,6 +177,15 @@ function lines() {
     const d = S.send.resp.data;
     L.push('  → sent=' + d.sent + (d.reason ? ' reason=' + d.reason : '') + (d.telegram ? ' | ответ Telegram: ' + JSON.stringify(d.telegram) : ''));
   }
+  L.push('');
+  if (S.batch) {
+    L.push('Прогон ' + S.batch.total + '×: ' + (S.batch.running ? 'идёт (' + S.batch.done + '/' + S.batch.total + ') ' : '') + 'успешно ' + S.batch.okCount + ' из ' + S.batch.done
+      + (S.batch.msList.length ? '; ответ успешных: медиана ' + median(S.batch.msList) + ' мс, макс ' + Math.max.apply(null, S.batch.msList) + ' мс' : ''));
+    S.batch.fails.forEach((f) => L.push('  сбой #' + f.i + ': HTTP ' + f.status + ', ' + f.ms + ' мс, «' + f.title + '» ' + (f.visible || '')));
+  }
+  L.push('HTTP-запросы (схема б; последние 25, всего ' + S.reqs.length + '):');
+  S.reqs.slice(-25).forEach((q) => L.push('  #' + q.n + ' ' + q.fn + ' поп.' + q.attempt + ' HTTP ' + q.status + (q.redirected ? ' (редирект)' : '')
+    + ' → ' + q.url + ' [' + q.ctype + '] ' + q.ms + ' мс ' + (q.ok ? 'JSON' : 'НЕ JSON «' + q.title + '» ' + (q.visible || '') + ' длина ' + q.len)));
   L.push('');
   L.push('Журнал:');
   return L.concat(S.log);
@@ -160,6 +212,25 @@ if (tg && tg.onEvent) tg.onEvent('writeAccessRequested', (e) => {
   S.access = Object.assign({}, S.access, { event: e && e.status });
   logEv('событие writeAccessRequested: ' + (e && e.status));
 });
+
+// 20 запросов ping подряд, пауза 1 с, без повторов: сколько раз Google отвечает не JSON.
+document.getElementById('bBatch').onclick = async (ev) => {
+  const btn = ev.target; btn.disabled = true;
+  const B = S.batch = { total: 20, done: 0, okCount: 0, running: true, fails: [], msList: [] };
+  for (let i = 1; i <= B.total; i++) {
+    const t = performance.now();
+    try {
+      if (scheme.startsWith('a')) { await call('ping', {}); B.okCount++; B.msList.push(Math.round(performance.now() - t)); }
+      else {
+        const q = await fetchOnce('ping', JSON.stringify({ fn: 'ping', args: {} }), 1);
+        if (q.ok) { B.okCount++; B.msList.push(q.ms); } else B.fails.push({ i: i, status: q.status, ms: q.ms, title: q.title, visible: q.visible });
+      }
+    } catch (e) { B.fails.push({ i: i, status: 'ошибка', ms: Math.round(performance.now() - t), title: String(e && e.message ? e.message : e) }); }
+    B.done = i; render();
+    if (i < B.total) await new Promise((r) => setTimeout(r, 1000));
+  }
+  B.running = false; btn.disabled = false; logEv('прогон 20× завершён: ' + B.okCount + ' из ' + B.total);
+};
 
 document.getElementById('bSend').onclick = () => run('send', 'sendTest', { initData: initData() });
 
