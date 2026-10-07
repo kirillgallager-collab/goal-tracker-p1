@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>P1 initData</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; padding: 12px 16px 32px; font: 14px/1.4 system-ui, sans-serif; background: Canvas; color: CanvasText; }
+  h1 { font-size: 16px; margin: 0 0 8px; }
+  .btns { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 12px; }
+  button { font: inherit; padding: 10px 14px; border-radius: 8px; border: 1px solid GrayText; background: ButtonFace; color: ButtonText; }
+  button:disabled { opacity: .5; }
+  pre { white-space: pre-wrap; word-break: break-all; font: 12px/1.45 ui-monospace, Consolas, monospace; margin: 0; }
+  textarea { width: 100%; height: 6em; margin-top: 8px; font: 12px ui-monospace, Consolas, monospace; display: none; box-sizing: border-box; }
+</style>
+</head>
+<body>
+<h1>P1: диагностика initData</h1>
+<div class="btns">
+  <button id="bVerify">Проверить</button>
+  <button id="bAccess">Запросить доступ</button>
+  <button id="bSend">Отправить тест</button>
+  <button id="bCopy">Скопировать отчёт</button>
+</div>
+<pre id="out"></pre>
+<textarea id="copyArea" readonly></textarea>
+
+<script>
+// Схема (б): адрес Apps Script /exec. Заглушка — подставить после развёртывания.
+// В схеме (а) страницу отдаёт сам Apps Script, константа не используется.
+const EXEC_URL = 'https://script.google.com/macros/s/AKfycbxwoEx_aE9L59A5bBgisfgJj6_k5c-ibIGEL8KNjWIS0Nm_Miz6Tf1kIwUPjS3gVs5HLA/exec';
+
+const t0 = performance.now();
+const tg = window.Telegram && window.Telegram.WebApp;
+const scheme = (typeof google !== 'undefined' && google.script && google.script.run) ? 'a (HtmlService)' : 'b (GitHub Pages + POST)';
+const S = {            // всё, что показываем; один источник для экрана и отчёта
+  log: [],
+  t: {},
+  verify: null, tamper: null, send: null, access: null, ping: null
+};
+
+function now() { return Math.round(performance.now()); }
+function logEv(msg) { S.log.push('+' + now() + 'мс ' + msg); render(); }
+
+function initData() { return (tg && tg.initData) || ''; }
+function unsafeUser() { return (tg && tg.initDataUnsafe && tg.initDataUnsafe.user) || null; }
+
+function urlParam(name) {
+  const sources = [location.search.slice(1), location.hash.slice(1)];
+  for (const src of sources) {
+    const v = new URLSearchParams(src).get(name);
+    if (v !== null) return v;
+  }
+  return null;
+}
+
+// Транспорт: google.script.run в схеме (а), fetch POST text/plain (без preflight) в схеме (б).
+function call(fn, args) {
+  const body = JSON.stringify({ fn: fn, args: args || {} });
+  const started = performance.now();
+  const done = (r) => ({ resp: r, roundtripMs: Math.round(performance.now() - started) });
+  if (scheme.startsWith('a')) {
+    return new Promise((resolve, reject) => {
+      google.script.run
+        .withSuccessHandler((s) => resolve(done(JSON.parse(s))))
+        .withFailureHandler((e) => reject(e))
+        .api(body);
+    });
+  }
+  return fetch(EXEC_URL, {
+    method: 'POST', redirect: 'follow',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: body
+  }).then((r) => r.text()).then((txt) => {
+    try { return done(JSON.parse(txt)); }
+    catch (e) { throw new Error('ответ не JSON: ' + txt.slice(0, 200)); }
+  });
+}
+
+// Намеренно испорченный initData: меняем последний символ hash.
+function tamperedInitData(s) {
+  return s.replace(/(hash=[0-9a-f]{63})([0-9a-f])/i, (m, a, b) => a + (b === '0' ? '1' : '0'));
+}
+
+function summarize(r) {
+  if (!r) return 'не запускалось';
+  if (r.error) return 'ОШИБКА: ' + r.error;
+  return JSON.stringify(r.resp) + ' | запрос→ответ ' + r.roundtripMs + ' мс';
+}
+
+async function run(name, fn, args) {
+  try {
+    const r = await call(fn, args);
+    S[name] = r;
+    logEv(name + ' ← ' + (r.resp.ok ? 'ok' : 'ошибка сервера'));
+  } catch (e) {
+    S[name] = { error: String(e && e.message ? e.message : e) };
+    logEv(name + ' ← сбой: ' + S[name].error);
+  }
+  render();
+}
+
+function lines() {
+  const u = unsafeUser();
+  const raw = initData();
+  const L = [];
+  L.push('Схема: ' + scheme);
+  L.push('Страница: ' + location.origin + location.pathname.slice(0, 60) + (window.self !== window.top ? ' (внутри фрейма)' : ' (верхний уровень)'));
+  L.push('Telegram.WebApp: ' + (tg ? 'есть' : 'НЕТ'));
+  L.push('Платформа: ' + (tg ? tg.platform : '-') + ', версия: ' + (tg ? tg.version : '-') + ', схема цвета: ' + (tg ? tg.colorScheme : '-'));
+  L.push('initData: ' + (raw ? 'есть, длина ' + raw.length : 'ПУСТО'));
+  L.push('start_param (initDataUnsafe): ' + JSON.stringify(tg && tg.initDataUnsafe ? tg.initDataUnsafe.start_param : undefined));
+  L.push('tgWebAppStartParam (URL): ' + JSON.stringify(urlParam('tgWebAppStartParam')));
+  L.push('ключи в location.hash: ' + (location.hash ? [...new URLSearchParams(location.hash.slice(1)).keys()].join(',') : 'пусто'));
+  L.push('user.id (клиент, не доверять): ' + (u ? u.id : '-'));
+  L.push('allows_write_to_pm (из initData при открытии): ' + (u ? JSON.stringify(u.allows_write_to_pm) : '-'));
+  L.push('Время: DOM→скрипт ' + Math.round(S.t.script) + ' мс; initData готов ' + (S.t.initData == null ? '-' : Math.round(S.t.initData) + ' мс') + ' (от начала навигации)');
+  L.push('Сервер (ping): ' + summarize(S.ping));
+  L.push('');
+  L.push('Проверка подписи сервером: ' + summarize(S.verify));
+  if (S.verify && S.verify.resp && S.verify.resp.ok) {
+    const d = S.verify.resp.data;
+    L.push('  → ' + (d.valid ? 'ПОДПИСЬ ВЕРНА' : 'ОТКАЗ: ' + d.reason) + (d.valid ? ', user.id сервера ' + d.userId + (u && u.id === d.userId ? ' (совпал с клиентом)' : ' (НЕ совпал)') : '') + ', serverMs ' + S.verify.resp.serverMs);
+  }
+  L.push('Испорченный initData: ' + summarize(S.tamper));
+  if (S.tamper && S.tamper.resp && S.tamper.resp.ok) {
+    const d = S.tamper.resp.data;
+    L.push('  → ' + (d.valid === false ? 'ОК, отклонён (' + d.reason + ')' : 'ПРОВАЛ: сервер принял испорченные данные'));
+  }
+  L.push('requestWriteAccess: ' + (S.access ? JSON.stringify(S.access) : 'не запускалось'));
+  L.push('Отправить тест: ' + summarize(S.send));
+  if (S.send && S.send.resp && S.send.resp.ok) {
+    const d = S.send.resp.data;
+    L.push('  → sent=' + d.sent + (d.reason ? ' reason=' + d.reason : '') + (d.telegram ? ' | ответ Telegram: ' + JSON.stringify(d.telegram) : ''));
+  }
+  L.push('');
+  L.push('Журнал:');
+  return L.concat(S.log);
+}
+
+function render() { document.getElementById('out').textContent = lines().join('\n'); }
+
+document.getElementById('bVerify').onclick = async () => {
+  S.t.verifyStart = now();
+  const raw = initData();
+  await run('verify', 'verify', { initData: raw });
+  await run('tamper', 'verify', { initData: tamperedInitData(raw) });
+};
+
+document.getElementById('bAccess').onclick = () => {
+  if (!tg || !tg.requestWriteAccess) { S.access = { error: 'requestWriteAccess недоступен (версия ' + (tg && tg.version) + ')' }; render(); return; }
+  tg.requestWriteAccess((granted) => {
+    S.access = Object.assign({}, S.access, { callbackGranted: granted });
+    logEv('requestWriteAccess callback: ' + granted + ' (allows_write_to_pm в initData обновится только после повторного открытия)');
+  });
+  logEv('requestWriteAccess вызван');
+};
+if (tg && tg.onEvent) tg.onEvent('writeAccessRequested', (e) => {
+  S.access = Object.assign({}, S.access, { event: e && e.status });
+  logEv('событие writeAccessRequested: ' + (e && e.status));
+});
+
+document.getElementById('bSend').onclick = () => run('send', 'sendTest', { initData: initData() });
+
+document.getElementById('bCopy').onclick = async () => {
+  const text = lines().join('\n');
+  try { await navigator.clipboard.writeText(text); logEv('отчёт скопирован'); return; } catch (e) { /* ниже запасной путь */ }
+  const ta = document.getElementById('copyArea');
+  ta.style.display = 'block'; ta.value = text; ta.focus(); ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (e) { /* ничего */ }
+  logEv(ok ? 'отчёт скопирован (запасной путь)' : 'копирование не удалось: выделите текст в поле ниже вручную');
+};
+
+if (tg) { try { tg.ready(); tg.expand && tg.expand(); } catch (e) {} }
+S.t.script = performance.now();
+S.t.initData = initData() ? performance.now() : null;
+logEv('страница загружена');
+// Пинг: проверяем доступность сервера и наличие токена (сам токен не возвращается).
+run('ping', 'ping', {});
+render();
+</script>
+</body>
+</html>
